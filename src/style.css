@@ -435,6 +435,18 @@ button.select-solution-btn.selected {
   color: var(--primary-dark);
 }
 
+.stale-hint {
+  color: #b45309;
+  font-weight: 600;
+}
+
+button.select-solution-btn:disabled {
+  border-color: var(--border);
+  background: #eef1f4;
+  color: var(--muted);
+  cursor: not-allowed;
+}
+
 .op-step {
   display: inline-block;
   margin: 4px 0;
