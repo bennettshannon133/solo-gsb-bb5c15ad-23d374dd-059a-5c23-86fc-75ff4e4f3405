@@ -208,6 +208,8 @@ app.innerHTML = `
         （最多 ${MAX_ROUTE_VALVES} 个），另填<strong>作业通道 JSON</strong>（路点、无向通道及正整数步行分钟、各阀门对应路点）
         与<strong>出发路点</strong>，规划从出发点出发、依次关闭全部必访阀门并返回的总步行时间最少完整路线
         （允许重复经过路点与通道；同耗时按关阀操作的阀门编号序列字典序取舍）。测算不修改拓扑与阀门登记状态。
+        修改拓扑 JSON、供水点、漏点或保供出口后，已选方案与旧路线结果会立即过期，须重新搜索后才能规划路线
+        （重新搜索后原清单仍属于新最优方案时保留选择，否则默认首个方案）；仅修改作业通道 JSON 或出发路点可直接重算当前方案路线。
       </p>
       <label>
         作业通道 JSON（waypoints / passages / valveWaypoints）
@@ -449,11 +451,59 @@ let deliveryFormState: string[] | null = null;
 
 /** 当前在关阀方案结果中选中的方案（待关闭阀门编号）；null 表示尚未选择有效方案。 */
 let selectedClosedValves: string[] | null = null;
+/** 最近一次选择过的阀门清单：输入变化导致过期后仍保留，供重新搜索成功后比对是否仍属于新最优方案。 */
+let lastSelectedClosedValves: string[] | null = null;
 /** 最近一次关阀方案搜索结果，供「选择该方案」按钮读取。 */
 let lastSolveResult: SolveResult | null = null;
+/**
+ * 已选方案 / 搜索结果是否已过期：拓扑 JSON、供水点、漏点、保供出口任一输入在最近一次
+ * 成功搜索之后被改动即为 true。过期时旧方案不得进入作业路线计算，需重新搜索。
+ */
+let solveInputsStale = false;
+/** 曾有过一次成功（有解）搜索后，输入过期才需要提示「重新搜索」；初始空白页不提示。 */
+let hadSuccessfulSolve = false;
+
+/**
+ * 使已选关阀方案与旧作业路线结果过期：在拓扑 JSON、供水点、漏点、保供出口变化时调用。
+ * 清空选择与旧结果展示，阻止旧清单进入后续路线计算，并提示重新搜索。
+ */
+function invalidateSolveInputs(): void {
+  solveInputsStale = true;
+  selectedClosedValves = null;
+  renderSelectedSolutionHint();
+  // 旧路线结果已不匹配当前输入：立即撤下，避免「旧清单配新输入」的错误路线继续展示
+  if (hadSuccessfulSolve) {
+    closureRouteResultEl.innerHTML = `
+      <div class="banner warn">
+        搜索条件已变化（拓扑 JSON、供水点、漏点或保供出口被修改），原已选关阀方案与作业路线结果
+        <strong>已过期</strong>。请先重新点击「搜索关阀方案」，再选择方案规划作业路线。
+      </div>`;
+  }
+  if (lastSolveResult && lastSolveResult.status === 'ok') {
+    // 在结果列表顶部提示重新搜索
+    if (!resultEl.querySelector('.stale-banner')) {
+      const banner = document.createElement('div');
+      banner.className = 'banner warn stale-banner';
+      banner.textContent = '搜索条件已变化：以下为旧输入的方案，已不能用于作业路线。请重新点击「搜索关阀方案」。';
+      resultEl.prepend(banner);
+    }
+    // 标记结果列表中的旧方案按钮，防止过期期间通过点击重新选中旧方案
+    resultEl.querySelectorAll<HTMLButtonElement>('.select-solution-btn').forEach((b) => {
+      b.classList.remove('selected');
+      b.textContent = '搜索条件已变化，请重新搜索';
+      b.disabled = true;
+    });
+  }
+}
 
 /** 刷新「已选方案」提示。 */
 function renderSelectedSolutionHint(): void {
+  if (solveInputsStale && hadSuccessfulSolve) {
+    selectedSolutionHintEl.textContent =
+      '搜索条件已变化（拓扑 JSON、供水点、漏点或保供出口被修改），原方案已过期：请重新点击「搜索关阀方案」后再选择方案规划作业路线。';
+    selectedSolutionHintEl.className = 'hint stale-hint';
+    return;
+  }
   if (selectedClosedValves === null) {
     selectedSolutionHintEl.textContent =
       '尚未选择方案：请先点击「搜索关阀方案」，再在结果中选择一个方案（默认选择推荐方案）。';
@@ -470,11 +520,14 @@ function renderSelectedSolutionHint(): void {
 
 /** 在关阀方案结果中选择某个方案作为作业路线的必访点（由结果区按钮事件委托调用）。 */
 function selectSolution(index: number): void {
+  // 输入已变化、结果过期时禁止再选择旧方案，必须先重新搜索
+  if (solveInputsStale) return;
   const current = lastSolveResult;
   if (!current || current.status !== 'ok') return;
   const sol = current.solutions[index];
   if (!sol) return;
   selectedClosedValves = [...sol.closed];
+  lastSelectedClosedValves = [...sol.closed];
   renderSelectedSolutionHint();
 }
 
@@ -520,6 +573,7 @@ function renderResult(result: SolveResult, query: Query): void {
   lastSolveResult = result;
   if (result.status === 'invalid') {
     selectedClosedValves = null;
+    // 搜索失败不解除过期态：仅 status === 'ok' 的重新搜索才重新绑定选择与输入
     renderSelectedSolutionHint();
     renderErrors(resultEl, '输入有误，无法求解：', result.errors);
     return;
@@ -534,16 +588,22 @@ function renderResult(result: SolveResult, query: Query): void {
     return;
   }
 
-  // 默认选择推荐方案（首个、字典序最小）；重新求解后若原选方案仍在则保留
+  // 重新搜索成功：选择与输入重新绑定，解除过期态
+  solveInputsStale = false;
+  hadSuccessfulSolve = true;
+  // 仅当原阀门清单仍属于新结果的最优方案时保留选择，否则默认首个（推荐）方案
   if (
-    selectedClosedValves === null ||
-    !result.solutions.some(
+    lastSelectedClosedValves !== null &&
+    result.solutions.some(
       (s) =>
-        s.closed.length === selectedClosedValves!.length &&
-        s.closed.every((v, i) => v === selectedClosedValves![i])
+        s.closed.length === lastSelectedClosedValves!.length &&
+        s.closed.every((v, i) => v === lastSelectedClosedValves![i])
     )
   ) {
+    selectedClosedValves = [...lastSelectedClosedValves];
+  } else {
     selectedClosedValves = [...result.solutions[0].closed];
+    lastSelectedClosedValves = [...result.solutions[0].closed];
   }
   renderSelectedSolutionHint();
 
@@ -1959,6 +2019,12 @@ function runObserverPlan(): void {
 
 function runClosureRoute(): void {
   try {
+    if (solveInputsStale) {
+      renderErrors(closureRouteResultEl, '搜索结果已过期：', [
+        '拓扑 JSON、供水点、漏点或保供出口在上次搜索后被修改（或尚未完成搜索），旧阀门清单不得用于当前输入的路线计算。请先重新点击「搜索关阀方案」，再选择方案规划作业路线。',
+      ]);
+      return;
+    }
     const network = readNetwork();
     if (selectedClosedValves === null) {
       renderErrors(closureRouteResultEl, '尚未选择关阀方案：', [
@@ -2140,6 +2206,15 @@ el<HTMLButtonElement>('#load-sample').addEventListener('click', () => {
   runValveAudit();
 });
 
+// 拓扑 JSON、供水点、漏点、保供出口任一变化：立即使已选方案与旧作业路线结果过期。
+// 仅这四项决定关阀方案清单；作业通道 JSON 与出发路点变化不过期，可直接重算当前方案路线。
+[topologyEl, suppliesEl, leakEl, outletsEl].forEach((inputEl) => {
+  inputEl.addEventListener('input', () => {
+    if (solveInputsStale) return;
+    invalidateSolveInputs();
+  });
+});
+
 el<HTMLButtonElement>('#solve').addEventListener('click', run);
 el<HTMLButtonElement>('#inspect').addEventListener('click', runInspection);
 el<HTMLButtonElement>('#verify-capacity').addEventListener('click', runCapacity);
@@ -2167,7 +2242,7 @@ el<HTMLButtonElement>('#build-delivery-form').addEventListener('click', () => {
 // 关阀方案结果区「选择该方案用于作业路线」按钮（事件委托）
 resultEl.addEventListener('click', (ev) => {
   const btn = (ev.target as HTMLElement).closest<HTMLButtonElement>('.select-solution-btn');
-  if (!btn) return;
+  if (!btn || btn.disabled) return;
   const index = Number(btn.dataset.solutionIndex);
   if (!Number.isInteger(index)) return;
   selectSolution(index);
